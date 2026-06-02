@@ -372,36 +372,48 @@ def draft_newsletter(top_items: list[NewsItem]) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def send_to_beehiiv(draft: dict, auto_send: bool = False) -> bool:
-    """Create a Beehiiv post. If auto_send is False, it's left in DRAFT state for your one-tap approval."""
-    if not BEEHIIV_KEY or not BEEHIIV_PUB:
-        log.warning("Beehiiv keys not set — printing draft to stdout instead.")
-        print("\n=== NEWSLETTER DRAFT ===")
-        print("Subject:", draft["subject_line"])
-        print("Preview:", draft["preview_text"])
-        print()
-        print(draft["body_markdown"])
-        print("=== END DRAFT ===\n")
-        return True
+    """Save the AI-drafted issue as a markdown file in drafts/ for you to copy-paste into Beehiiv.
 
-    url = f"https://api.beehiiv.com/v2/publications/{BEEHIIV_PUB}/posts"
-    payload = {
-        "title": draft["subject_line"],
-        "subtitle": draft["preview_text"],
-        "body_content": draft["body_markdown"],
-        "status": "confirmed" if auto_send else "draft",
-        "content_tags": [CONFIG["niche"]],
-    }
-    resp = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {BEEHIIV_KEY}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=30,
+    Why not direct API post: Beehiiv gates the Posts API behind their Enterprise plan
+    (custom-priced, $$$). Saving the draft to a file is the cleanest workaround at lower tiers.
+
+    Workflow:
+      1. This script writes drafts/YYYY-MM-DD.md on every run that produces an issue.
+      2. The GitHub Actions auto-commit step pushes it to the repo.
+      3. With the GitHub mobile app installed and repo notifications on, you get a phone
+         push when a new draft lands. Tap, copy the markdown, paste into Beehiiv → Posts
+         → New post → paste body → set subject from the heading → Send. Total: ~90 seconds.
+
+    The `auto_send` arg is kept for future use if/when Beehiiv changes their pricing.
+    """
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = Path("drafts")
+    out_dir.mkdir(exist_ok=True)
+
+    # If a draft for today already exists, suffix with -v2, -v3, etc.
+    draft_file = out_dir / f"{timestamp}.md"
+    iteration = 1
+    while draft_file.exists():
+        iteration += 1
+        draft_file = out_dir / f"{timestamp}-v{iteration}.md"
+
+    content = (
+        f"# {draft['subject_line']}\n\n"
+        f"**Preview text:** {draft['preview_text']}\n\n"
+        f"**Self-grade:** {draft.get('self_grade', 'n/a')} / 100\n\n"
+        "---\n\n"
+        f"{draft['body_markdown']}\n"
     )
-    if resp.ok:
-        log.info("Newsletter posted to Beehiiv (auto_send=%s)", auto_send)
-        return True
-    log.error("Beehiiv error %d: %s", resp.status_code, resp.text)
-    return False
+    draft_file.write_text(content)
+    log.info("Draft saved to %s — paste into Beehiiv to send", draft_file)
+
+    # Also print to the Actions log so you can read it directly in GitHub if you prefer
+    print("\n=== NEWSLETTER DRAFT ===")
+    print(f"File: {draft_file}")
+    print(f"Subject: {draft['subject_line']}")
+    print(f"Preview: {draft['preview_text']}")
+    print("=== END ===\n")
+    return True
 
 
 # ---------------------------------------------------------------------------
