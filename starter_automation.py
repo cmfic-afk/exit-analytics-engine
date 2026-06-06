@@ -71,31 +71,36 @@ CONFIG = {
         "genuinely required for compliance)."
     ),
 
-    # RSS feeds to watch — verify each loads in a browser before pushing.
-    # Reddit feeds occasionally rate-limit; if so the script logs a warning and continues.
+    # RSS feeds — curated for primary-data and high-signal commentary.
+    # Each feed will hit the scorer; bad days will surface warnings in the logs and
+    # the engine continues. Verify any URL flagged as failing in the logs.
     "rss_feeds": [
-        # Core FIRE blogs (active)
-        "https://www.mrmoneymustache.com/feed/",
-        "https://www.madfientist.com/feed/",
-        "https://earlyretirementnow.com/feed/",
-        "https://www.physicianonfire.com/feed/",
-        "https://www.financialsamurai.com/feed/",
-        "https://www.choosefi.com/feed/",
-        "https://www.theretirementmanifesto.com/feed/",
-        # Data-driven investing & macro
-        "https://ofdollarsanddata.com/feed/",
-        "https://awealthofcommonsense.com/feed/",
-        "https://ritholtz.com/feed/",
-        # Reddit communities (use .rss endpoint)
+        # ============ Primary government / regulatory sources ============
+        # These are the news that actually moves FIRE math. Rate decisions, tax
+        # law changes, contribution limits, official inflation prints.
+        "https://www.federalreserve.gov/feeds/press_all.xml",         # Fed press releases
+        "https://www.bls.gov/feed/news_release.rss",                  # BLS (CPI, jobs reports)
+        "https://www.irs.gov/pub/irs-utl/irsnewsfeed.xml",            # IRS news (verify URL)
+
+        # ============ Data-driven analysis blogs (the high-signal core) ============
+        "https://ofdollarsanddata.com/feed/",        # Nick Maggiulli — original quantitative analysis
+        "https://awealthofcommonsense.com/feed/",    # Ben Carlson — daily, data-grounded
+        "https://earlyretirementnow.com/feed/",      # Karsten — heavy math on withdrawal rates
+        "https://www.madfientist.com/feed/",         # Mad Fientist — infrequent but high quality
+        "https://www.physicianonfire.com/feed/",     # High-earner focus
+        "https://www.whitecoatinvestor.com/feed/",   # WCI — extremely tactical, high-earner
+
+        # ============ Tax & policy analysis ============
+        "https://taxfoundation.org/feed/",           # Tax policy think tank
+
+        # ============ Bogleheads forum (Investing Theory only — high-signal subset) ============
+        "https://www.bogleheads.org/forum/feed.php?f=10",  # Investing Theory subforum
+
+        # ============ Reddit (high-signal subset only) ============
+        # Dropped: r/Fire, r/leanFIRE, r/fatFIRE, r/ChubbyFIRE, r/Bogleheads
+        # (anecdotal noise; r/financialindependence and r/HENRYfinance carry the signal)
         "https://www.reddit.com/r/financialindependence/.rss",
-        "https://www.reddit.com/r/Fire/.rss",
-        "https://www.reddit.com/r/leanfire/.rss",
-        "https://www.reddit.com/r/fatFIRE/.rss",
-        "https://www.reddit.com/r/ChubbyFIRE/.rss",
         "https://www.reddit.com/r/HENRYfinance/.rss",
-        "https://www.reddit.com/r/Bogleheads/.rss",
-        # General signal — the scorer will filter for FIRE relevance
-        "https://news.ycombinator.com/rss",
     ],
 
     # Affiliate products — empty until you're approved into the programs below.
@@ -173,7 +178,13 @@ class NewsItem:
 
 @dataclass
 class MarketData:
-    """A week's snapshot of the numbers that drive the FIRE math."""
+    """A week's snapshot of the numbers that drive the FIRE math.
+
+    Note: ETF price data was intentionally removed. Free sources (Stooq, Yahoo) either
+    block cloud IPs or only provide price (no yield/distribution), which would make us
+    a basic data-aggregator rather than an analytical publication. If a specific Move
+    template ever needs live ETF yields, add a paid source (Polygon/Alpha Vantage) then.
+    """
     # Treasury yields
     treasury_3mo: float | None = None
     treasury_2y: float | None = None
@@ -184,10 +195,6 @@ class MarketData:
     fed_funds: float | None = None
     cpi_yoy: float | None = None       # core CPI YoY %
     mortgage_30y: float | None = None
-    # ETF prices and yields (key FIRE holdings)
-    etfs: dict = field(default_factory=dict)  # ticker -> {price, change_pct, yield_pct, distribution}
-    # Cash equivalents
-    top_hysa_apy: float | None = None  # informational; not all readers can access top rates
     # Meta
     as_of: str = ""
     sources: list = field(default_factory=list)
@@ -261,15 +268,9 @@ def claude_json(model: str, prompt: str, max_tokens: int = 4096) -> dict:
 # produces; it just omits those numbers.
 #
 # Sources:
-#   - Treasury yields: api.fiscaldata.treasury.gov (no key)
-#   - Fed funds, CPI, mortgage: FRED API (key required)
-#   - ETF prices/yields: Yahoo Finance v7 endpoint (no key)
+#   - Treasury yields: FRED (DGS3MO, DGS2, DGS10, DGS30)
+#   - Fed funds, CPI, mortgage: FRED (DFF, CPILFESL, MORTGAGE30US)
 # ---------------------------------------------------------------------------
-
-YAHOO_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; ExitAnalytics/1.0)",
-    "Accept": "application/json",
-}
 
 
 def fetch_treasury_yields(market: MarketData) -> None:
@@ -364,62 +365,11 @@ def fetch_macro_data(market: MarketData) -> None:
         market.sources.append("Federal Reserve Economic Data, St. Louis Fed (FRED)")
 
 
-def fetch_etf_data(market: MarketData, tickers: list[str]) -> None:
-    """Pull ETF prices from Stooq.com. Free, no key, doesn't block cloud IPs.
-
-    Note: Stooq provides current price and historical close data, but not yield or
-    distribution data. For yield/distribution info we'd need a paid source; for now
-    the briefing reports price and leaves yield off (more honest than a stale number).
-    """
-    if not tickers:
-        return
-    # Stooq uses lowercase tickers with .us suffix
-    stooq_symbols = ",".join(f"{t.lower()}.us" for t in tickers)
-    url = f"https://stooq.com/q/l/?s={stooq_symbols}&f=sd2t2ohlcv&h&e=csv"
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        r.raise_for_status()
-        lines = [ln.strip() for ln in r.text.strip().split("\n") if ln.strip()]
-        if len(lines) < 2:
-            log.warning("Stooq returned no data rows.")
-            return
-        header = [h.strip() for h in lines[0].split(",")]
-        try:
-            sym_idx = header.index("Symbol")
-            close_idx = header.index("Close")
-        except ValueError:
-            log.warning("Stooq CSV header unexpected: %s", header)
-            return
-        for line in lines[1:]:
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) <= max(sym_idx, close_idx):
-                continue
-            try:
-                ticker = parts[sym_idx].upper().replace(".US", "")
-                price = float(parts[close_idx])
-                market.etfs[ticker] = {
-                    "price": price,
-                    "change_pct_day": None,
-                    "change_pct_52w": None,
-                    "yield_pct": None,
-                    "distribution": None,
-                }
-            except (ValueError, IndexError):
-                continue
-        if market.etfs:
-            market.sources.append("Stooq.com ETF data")
-    except Exception as e:
-        log.warning("Stooq ETF fetch failed: %s", e)
-
-
-def fetch_market_data(etf_tickers: list[str] | None = None) -> MarketData:
+def fetch_market_data() -> MarketData:
     """One-stop fetch for the week's market snapshot."""
-    if etf_tickers is None:
-        etf_tickers = ["SCHD", "JEPQ", "JEPI", "VTI", "VOO", "VYM", "VXUS", "BND"]
     market = MarketData()
     fetch_treasury_yields(market)
     fetch_macro_data(market)
-    fetch_etf_data(market, etf_tickers)
     return market
 
 
@@ -452,11 +402,6 @@ def format_market_data_md(market: MarketData) -> str:
     row("Federal Funds Rate", market.fed_funds, "{:.2f}%")
     row("Core CPI (year-over-year)", market.cpi_yoy, "{:.1f}%")
     row("30-year mortgage average", market.mortgage_30y, "{:.2f}%")
-    # ETFs (price only; yield/distribution data not available from current source)
-    for ticker, data in market.etfs.items():
-        price = data.get("price")
-        if price is not None:
-            lines.append(f"| {ticker} ETF price | ${price:,.2f} |  |")
     if market.as_of:
         lines.append("")
         lines.append(f"*Data as of {market.as_of}. Sources: {'; '.join(market.sources)}.*")
