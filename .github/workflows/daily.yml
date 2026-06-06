@@ -1,12 +1,14 @@
-name: Daily Content Engine
+name: Exit Analytics Engine
 on:
   schedule:
-    - cron: '0 13 * * *'
+    # Weekly briefing: Friday 13:00 UTC = 9am ET (Daylight) / 8am ET (Standard)
+    - cron: '0 13 * * 5'
+    # SEO page generation: Monday + Thursday at 14:00 UTC
     - cron: '0 14 * * 1,4'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Mode (use market_data to test commit 1)'
+        description: 'Mode (daily = build this week briefing now; market_data = test data fetchers)'
         type: choice
         options:
           - daily
@@ -27,8 +29,8 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install anthropic feedparser requests
-      - name: Run daily pipeline
-        if: github.event.schedule == '0 13 * * *' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'daily')
+      - name: Run weekly briefing pipeline
+        if: github.event.schedule == '0 13 * * 5' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'daily')
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           BEEHIIV_API_KEY: ${{ secrets.BEEHIIV_API_KEY }}
