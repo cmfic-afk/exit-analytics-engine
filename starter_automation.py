@@ -273,35 +273,63 @@ YAHOO_HEADERS = {
 
 
 def fetch_treasury_yields(market: MarketData) -> None:
-    """Fetch latest US Treasury daily yield curve. Public API, no key."""
+    """Fetch Treasury constant-maturity yields via FRED. Requires FRED_API_KEY.
+
+    The fiscaldata.treasury.gov endpoint was unstable (path changes); FRED is the
+    source the Federal Reserve itself uses and stays consistent.
+    """
+    if not FRED_KEY:
+        log.info("FRED_API_KEY not set — skipping Treasury yield fetch.")
+        return
+    series_to_attr = {
+        "DGS3MO": "treasury_3mo",
+        "DGS2": "treasury_2y",
+        "DGS10": "treasury_10y",
+        "DGS30": "treasury_30y",
+    }
+    for series_id, attr in series_to_attr.items():
+        val = fetch_fred_series(series_id)
+        if val is not None:
+            setattr(market, attr, val)
+    # Prior-week 10Y for week-over-week change calc
+    prior = fetch_fred_series_prior("DGS10", days_back=7)
+    if prior is not None:
+        market.treasury_10y_prior_week = prior
+    if market.treasury_10y is not None:
+        market.as_of = datetime.now(timezone.utc).date().isoformat()
+        market.sources.append("US Treasury yields via Federal Reserve Economic Data (FRED)")
+
+
+def fetch_fred_series_prior(series_id: str, days_back: int = 7) -> float | None:
+    """Find the observation closest to N days before today for a daily series."""
+    if not FRED_KEY:
+        return None
     url = (
-        "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/"
-        "accounting/od/daily_treasury_yield_curve_rates"
-        "?sort=-record_date&page[size]=10"
+        "https://api.stlouisfed.org/fred/series/observations"
+        f"?series_id={series_id}&api_key={FRED_KEY}&file_type=json"
+        "&sort_order=desc&limit=20"
     )
     try:
+        from datetime import timedelta
         r = requests.get(url, timeout=20)
         r.raise_for_status()
-        rows = r.json().get("data", [])
-        if not rows:
-            return
-        latest = rows[0]
-        market.treasury_3mo = _to_float(latest.get("bc_3month"))
-        market.treasury_2y = _to_float(latest.get("bc_2year"))
-        market.treasury_10y = _to_float(latest.get("bc_10year"))
-        market.treasury_30y = _to_float(latest.get("bc_30year"))
-        market.as_of = latest.get("record_date", market.as_of)
-        # Find the 10Y from ~7 calendar days earlier for the week-over-week change
-        for row in rows[1:]:
-            d = row.get("record_date", "")
-            if d and d < latest.get("record_date", ""):
-                ten = _to_float(row.get("bc_10year"))
-                if ten is not None:
-                    market.treasury_10y_prior_week = ten
-                    break
-        market.sources.append("US Treasury daily yield curve (fiscaldata.treasury.gov)")
+        obs = r.json().get("observations", [])
+        if not obs:
+            return None
+        target = datetime.now(timezone.utc).date() - timedelta(days=days_back)
+        best, best_diff = None, 999
+        for o in obs:
+            try:
+                d = datetime.strptime(o["date"], "%Y-%m-%d").date()
+                diff = abs((d - target).days)
+                if diff < best_diff and o.get("value") not in (".", "", None):
+                    best, best_diff = float(o["value"]), diff
+            except (ValueError, KeyError):
+                continue
+        return best
     except Exception as e:
-        log.warning("Treasury yield fetch failed: %s", e)
+        log.warning("FRED prior series fetch failed for %s: %s", series_id, e)
+        return None
 
 
 def fetch_fred_series(series_id: str, units: str = "lin") -> float | None:
@@ -337,30 +365,51 @@ def fetch_macro_data(market: MarketData) -> None:
 
 
 def fetch_etf_data(market: MarketData, tickers: list[str]) -> None:
-    """Pull current price, week-over-week % change, and trailing distribution yield from Yahoo Finance."""
+    """Pull ETF prices from Stooq.com. Free, no key, doesn't block cloud IPs.
+
+    Note: Stooq provides current price and historical close data, but not yield or
+    distribution data. For yield/distribution info we'd need a paid source; for now
+    the briefing reports price and leaves yield off (more honest than a stale number).
+    """
     if not tickers:
         return
-    symbols = ",".join(tickers)
-    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols}"
+    # Stooq uses lowercase tickers with .us suffix
+    stooq_symbols = ",".join(f"{t.lower()}.us" for t in tickers)
+    url = f"https://stooq.com/q/l/?s={stooq_symbols}&f=sd2t2ohlcv&h&e=csv"
     try:
-        r = requests.get(url, headers=YAHOO_HEADERS, timeout=20)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
-        results = r.json().get("quoteResponse", {}).get("result", [])
-        for q in results:
-            ticker = q.get("symbol")
-            if not ticker:
+        lines = [ln.strip() for ln in r.text.strip().split("\n") if ln.strip()]
+        if len(lines) < 2:
+            log.warning("Stooq returned no data rows.")
+            return
+        header = [h.strip() for h in lines[0].split(",")]
+        try:
+            sym_idx = header.index("Symbol")
+            close_idx = header.index("Close")
+        except ValueError:
+            log.warning("Stooq CSV header unexpected: %s", header)
+            return
+        for line in lines[1:]:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) <= max(sym_idx, close_idx):
                 continue
-            market.etfs[ticker] = {
-                "price": q.get("regularMarketPrice"),
-                "change_pct_day": q.get("regularMarketChangePercent"),
-                "change_pct_52w": q.get("fiftyTwoWeekChangePercent"),
-                "yield_pct": (q.get("trailingAnnualDividendYield") or 0) * 100 if q.get("trailingAnnualDividendYield") else None,
-                "distribution": q.get("trailingAnnualDividendRate"),
-            }
+            try:
+                ticker = parts[sym_idx].upper().replace(".US", "")
+                price = float(parts[close_idx])
+                market.etfs[ticker] = {
+                    "price": price,
+                    "change_pct_day": None,
+                    "change_pct_52w": None,
+                    "yield_pct": None,
+                    "distribution": None,
+                }
+            except (ValueError, IndexError):
+                continue
         if market.etfs:
-            market.sources.append("Yahoo Finance quote API")
+            market.sources.append("Stooq.com ETF data")
     except Exception as e:
-        log.warning("Yahoo Finance fetch failed: %s", e)
+        log.warning("Stooq ETF fetch failed: %s", e)
 
 
 def fetch_market_data(etf_tickers: list[str] | None = None) -> MarketData:
@@ -403,13 +452,11 @@ def format_market_data_md(market: MarketData) -> str:
     row("Federal Funds Rate", market.fed_funds, "{:.2f}%")
     row("Core CPI (year-over-year)", market.cpi_yoy, "{:.1f}%")
     row("30-year mortgage average", market.mortgage_30y, "{:.2f}%")
-    # ETFs
+    # ETFs (price only; yield/distribution data not available from current source)
     for ticker, data in market.etfs.items():
         price = data.get("price")
-        yld = data.get("yield_pct")
         if price is not None:
-            yld_str = f"trailing yield {yld:.2f}%" if yld else ""
-            lines.append(f"| {ticker} ETF price | ${price:,.2f} | {yld_str} |")
+            lines.append(f"| {ticker} ETF price | ${price:,.2f} |  |")
     if market.as_of:
         lines.append("")
         lines.append(f"*Data as of {market.as_of}. Sources: {'; '.join(market.sources)}.*")
