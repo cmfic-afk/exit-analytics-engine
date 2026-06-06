@@ -249,7 +249,7 @@ MOVE_TEMPLATES = [
         "title_hint": "When the Roth conversion math beats tax-deferral",
         "core_question": "Given current 10-year Treasury yield and equity expected returns, at what marginal tax bracket does a Roth conversion become net-positive compared to leaving funds in a Traditional Individual Retirement Account (IRA)?",
         "data_needs": ["treasury_10y"],
-        "instructions": "Walk through three tax bracket scenarios (24%, 32%, 35%). Calculate: (a) current tax cost of conversion at each bracket, (b) projected future tax savings assuming Required Minimum Distributions (RMDs) begin at 73, (c) opportunity cost using the current 10-year Treasury yield as the risk-free comparison. Use real numbers; show the math. Conclude with the marginal bracket at which conversion is clearly favorable. Specify assumed retirement age and time-to-RMD."
+        "instructions": "Use the terminal after-tax value framing (the standard quantitative approach): compare (a) Roth terminal value = (principal − conversion_tax) × (1 + r)^n, fully tax-free, vs (b) Traditional terminal value × (1 − tax_at_RMD). Run three bracket scenarios (24%, 32%, 35%) with consistent assumptions: $200K principal, 18-year horizon to Required Minimum Distribution (RMD), 7% nominal return, conversion tax paid from outside the IRA (the only structurally honest comparison). For each bracket, show the side-by-side terminal values and the dollar gap. Then add a Tax Cuts and Jobs Act (TCJA) sunset sensitivity: re-run assuming RMD-era brackets revert (35% → 39.6%, 32% → 35%) and show how the conclusion shifts. Conclude with the bracket where conversion's terminal value clearly beats deferral. The current 10-year Treasury matters mainly as the discount rate when sensitivity-testing the 'pay conversion tax from outside funds' assumption."
     },
     {
         "id": "after_tax_yield_ranking",
@@ -379,7 +379,20 @@ ACRONYM_GUIDE = """First use of any acronym in this issue MUST spell out the ter
 - IRS → Internal Revenue Service (IRS)
 - AUM → Assets Under Management (AUM)
 - DRIP → Dividend Reinvestment Plan (DRIP)
-Treat ETF tickers (SCHD, JEPQ, VTI, VOO) as readable as-is, but spell out the fund name on first use, e.g. 'Schwab US Dividend Equity ETF (SCHD)'."""
+- FOMC → Federal Open Market Committee (FOMC)
+- SECURE → Setting Every Community Up for Retirement Enhancement Act (SECURE Act)
+- TIPS → Treasury Inflation-Protected Securities (TIPS)
+- SEP-IRA → Simplified Employee Pension Individual Retirement Account (SEP-IRA)
+- SIMPLE → Savings Incentive Match Plan for Employees (SIMPLE IRA)
+- QCD → Qualified Charitable Distribution (QCD)
+- LTCG → Long-Term Capital Gains (LTCG)
+- AMT → Alternative Minimum Tax (AMT)
+- NIIT → Net Investment Income Tax (NIIT)
+- WoW → Week-over-Week (WoW)
+- YoY → Year-over-Year (YoY)
+- YTD → Year-to-Date (YTD)
+Treat ETF tickers (SCHD, JEPQ, VTI, VOO) as readable as-is, but spell out the fund name on first use, e.g. 'Schwab US Dividend Equity ETF (SCHD)'.
+This rule is strict. Reread the body before returning JSON and confirm every acronym was spelled out at first appearance."""
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +716,9 @@ Title hint (you can refine; keep the core idea): {move_title_hint}
 Core question to answer: {move_core_question}
 Specific analysis instructions: {move_instructions}
 
-This is the most important section of the issue. Do real math with the actual current data above. Show calculations. Cite specific numbers, real tax code sections, real fund expense ratios where relevant. 300-500 words. NOT a summary of someone else's analysis — original calculation in our voice.
+This is the most important section of the issue. Do real math with the actual current data above. Show calculations. Cite specific numbers, real tax code sections, real fund expense ratios where relevant. **400-700 words** — analysis takes space; don't artificially cap it. NOT a summary of someone else's analysis — original calculation in our voice.
+
+**Preferred analytical framing for retirement-account decisions:** compare **terminal after-tax values** directly rather than mixing opportunity-cost and present-value approaches. For Roth-vs-Traditional decisions specifically: Roth terminal = (principal − conversion_tax) × (1 + r)^n vs Traditional terminal = principal × (1 + r)^n × (1 − tax_at_RMD). This matches how Bogleheads, CFP candidates, and most quantitative writers frame these problems and avoids the confusion of comparing opportunity costs against present-valued tax liabilities.
 
 == TOP SCORED NEWS ITEMS (for the 'Three Reads' section) ==
 {items_json}
@@ -739,11 +754,14 @@ The body markdown must follow exactly this structure:
 
 == FORBIDDEN ==
 - Filler phrases: "in today's economy", "experts say", "it depends on your goals", "as we all know", "navigating these uncertain times"
+- Casual interjections that don't belong in a dry analytical publication: "But wait —", "Here's the thing", "Here's where it gets interesting", "Now here's the kicker", "Let me explain", "buckle up", "spoiler"
+- Conversational hedges: "you might be wondering", "it's worth noting that", "interestingly enough"
 - Hedging without value: "you should probably consider" without saying when or why
 - Fabricated statistics, study citations, or quotes
 - "AI assistant" or "as an AI" anywhere
 - Generic financial-advice-blog tone
 - Replacing the disclaimer footer text; copy it verbatim
+- Em-dash bridging between two thoughts when a period would do the same work cleaner
 
 == SUBJECT LINE ==
 6 words maximum. Punchy. Hints at the most surprising figure in The Numbers or the punchline of The Move. Examples of good ones:
