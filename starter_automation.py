@@ -116,10 +116,10 @@ CONFIG = {
         # {"id": "empower",        "name": "Empower",        "category": "financial dashboard",  "url": "https://empower.com/REPLACE_ME"},
     ],
 
-    # Behaviour knobs
-    "score_threshold": 70,           # items below this are dropped
-    "min_items_to_send": 5,          # fewer than this and we skip the day
-    "publish_grade_threshold": 70,   # newsletter draft must self-grade >= this to send
+    # Behaviour knobs — start permissive, tighten as the engine matures
+    "score_threshold": 55,           # items below this are dropped (raise to 65-70 once mature)
+    "min_items_to_send": 3,          # fewer than this and we skip the day (raise to 5 once mature)
+    "publish_grade_threshold": 60,   # newsletter draft must self-grade >= this to send
     "pages_per_seo_run": 3,          # how many SEO pages to generate per run
     "models": {
         "cheap": "claude-haiku-4-5-20251001",
@@ -142,9 +142,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("retirement-maxing")
 
-CLAUDE = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+_CLAUDE_CLIENT = None  # lazy-init so market_data mode works without ANTHROPIC_API_KEY
 BEEHIIV_KEY = os.environ.get("BEEHIIV_API_KEY", "")
 BEEHIIV_PUB = os.environ.get("BEEHIIV_PUBLICATION_ID", "")
+FRED_KEY = os.environ.get("FRED_API_KEY", "")  # Optional; market-data fields gracefully degrade if missing
+
+
+def _claude() -> Anthropic:
+    global _CLAUDE_CLIENT
+    if _CLAUDE_CLIENT is None:
+        _CLAUDE_CLIENT = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    return _CLAUDE_CLIENT
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +169,34 @@ class NewsItem:
     score: int = 0
     one_line_take: str = ""
     affiliate_url: str | None = None
+
+
+@dataclass
+class MarketData:
+    """A week's snapshot of the numbers that drive the FIRE math."""
+    # Treasury yields
+    treasury_3mo: float | None = None
+    treasury_2y: float | None = None
+    treasury_10y: float | None = None
+    treasury_30y: float | None = None
+    treasury_10y_prior_week: float | None = None
+    # Macro
+    fed_funds: float | None = None
+    cpi_yoy: float | None = None       # core CPI YoY %
+    mortgage_30y: float | None = None
+    # ETF prices and yields (key FIRE holdings)
+    etfs: dict = field(default_factory=dict)  # ticker -> {price, change_pct, yield_pct, distribution}
+    # Cash equivalents
+    top_hysa_apy: float | None = None  # informational; not all readers can access top rates
+    # Meta
+    as_of: str = ""
+    sources: list = field(default_factory=list)
+
+    @property
+    def treasury_10y_change(self) -> float | None:
+        if self.treasury_10y is not None and self.treasury_10y_prior_week is not None:
+            return round(self.treasury_10y - self.treasury_10y_prior_week, 2)
+        return None
 
 
 @dataclass
@@ -196,7 +232,7 @@ def claude_json(model: str, prompt: str, max_tokens: int = 4096) -> dict:
     """Call Claude and parse a JSON response. Retries on transient errors."""
     for attempt in range(3):
         try:
-            resp = CLAUDE.messages.create(
+            resp = _claude().messages.create(
                 model=model,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
@@ -213,6 +249,171 @@ def claude_json(model: str, prompt: str, max_tokens: int = 4096) -> dict:
             log.warning("claude_json attempt %d failed: %s", attempt + 1, e)
             time.sleep(2 ** attempt)
     raise RuntimeError("claude_json failed after 3 attempts")
+
+
+# ---------------------------------------------------------------------------
+# Market data fetchers (Treasury, Fed, CPI, ETFs)
+# ---------------------------------------------------------------------------
+#
+# All sources are free; one (FRED) requires a free API key (30-second signup
+# at https://fred.stlouisfed.org/docs/api/api_key.html). If FRED_API_KEY is
+# unset, the macro fields gracefully degrade to None and the briefing still
+# produces; it just omits those numbers.
+#
+# Sources:
+#   - Treasury yields: api.fiscaldata.treasury.gov (no key)
+#   - Fed funds, CPI, mortgage: FRED API (key required)
+#   - ETF prices/yields: Yahoo Finance v7 endpoint (no key)
+# ---------------------------------------------------------------------------
+
+YAHOO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ExitAnalytics/1.0)",
+    "Accept": "application/json",
+}
+
+
+def fetch_treasury_yields(market: MarketData) -> None:
+    """Fetch latest US Treasury daily yield curve. Public API, no key."""
+    url = (
+        "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/"
+        "accounting/od/daily_treasury_yield_curve_rates"
+        "?sort=-record_date&page[size]=10"
+    )
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        rows = r.json().get("data", [])
+        if not rows:
+            return
+        latest = rows[0]
+        market.treasury_3mo = _to_float(latest.get("bc_3month"))
+        market.treasury_2y = _to_float(latest.get("bc_2year"))
+        market.treasury_10y = _to_float(latest.get("bc_10year"))
+        market.treasury_30y = _to_float(latest.get("bc_30year"))
+        market.as_of = latest.get("record_date", market.as_of)
+        # Find the 10Y from ~7 calendar days earlier for the week-over-week change
+        for row in rows[1:]:
+            d = row.get("record_date", "")
+            if d and d < latest.get("record_date", ""):
+                ten = _to_float(row.get("bc_10year"))
+                if ten is not None:
+                    market.treasury_10y_prior_week = ten
+                    break
+        market.sources.append("US Treasury daily yield curve (fiscaldata.treasury.gov)")
+    except Exception as e:
+        log.warning("Treasury yield fetch failed: %s", e)
+
+
+def fetch_fred_series(series_id: str, units: str = "lin") -> float | None:
+    """Pull the latest observation from a FRED series. Returns None if no key or on error."""
+    if not FRED_KEY:
+        return None
+    url = (
+        "https://api.stlouisfed.org/fred/series/observations"
+        f"?series_id={series_id}&api_key={FRED_KEY}&file_type=json"
+        f"&sort_order=desc&limit=1&units={units}"
+    )
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        obs = r.json().get("observations", [])
+        if obs and obs[0].get("value") not in (".", "", None):
+            return float(obs[0]["value"])
+    except Exception as e:
+        log.warning("FRED fetch failed for %s: %s", series_id, e)
+    return None
+
+
+def fetch_macro_data(market: MarketData) -> None:
+    """Federal Funds Rate, core CPI YoY, 30-year mortgage average — all via FRED."""
+    if not FRED_KEY:
+        log.info("FRED_API_KEY not set — skipping macro fetch (Fed funds, CPI, mortgage will be blank).")
+        return
+    market.fed_funds = fetch_fred_series("DFF")
+    market.cpi_yoy = fetch_fred_series("CPILFESL", units="pc1")  # Core CPI, 12-month % change
+    market.mortgage_30y = fetch_fred_series("MORTGAGE30US")
+    if any([market.fed_funds, market.cpi_yoy, market.mortgage_30y]):
+        market.sources.append("Federal Reserve Economic Data, St. Louis Fed (FRED)")
+
+
+def fetch_etf_data(market: MarketData, tickers: list[str]) -> None:
+    """Pull current price, week-over-week % change, and trailing distribution yield from Yahoo Finance."""
+    if not tickers:
+        return
+    symbols = ",".join(tickers)
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols}"
+    try:
+        r = requests.get(url, headers=YAHOO_HEADERS, timeout=20)
+        r.raise_for_status()
+        results = r.json().get("quoteResponse", {}).get("result", [])
+        for q in results:
+            ticker = q.get("symbol")
+            if not ticker:
+                continue
+            market.etfs[ticker] = {
+                "price": q.get("regularMarketPrice"),
+                "change_pct_day": q.get("regularMarketChangePercent"),
+                "change_pct_52w": q.get("fiftyTwoWeekChangePercent"),
+                "yield_pct": (q.get("trailingAnnualDividendYield") or 0) * 100 if q.get("trailingAnnualDividendYield") else None,
+                "distribution": q.get("trailingAnnualDividendRate"),
+            }
+        if market.etfs:
+            market.sources.append("Yahoo Finance quote API")
+    except Exception as e:
+        log.warning("Yahoo Finance fetch failed: %s", e)
+
+
+def fetch_market_data(etf_tickers: list[str] | None = None) -> MarketData:
+    """One-stop fetch for the week's market snapshot."""
+    if etf_tickers is None:
+        etf_tickers = ["SCHD", "JEPQ", "JEPI", "VTI", "VOO", "VYM", "VXUS", "BND"]
+    market = MarketData()
+    fetch_treasury_yields(market)
+    fetch_macro_data(market)
+    fetch_etf_data(market, etf_tickers)
+    return market
+
+
+def _to_float(x) -> float | None:
+    try:
+        if x in (None, "", "N/A"):
+            return None
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_market_data_md(market: MarketData) -> str:
+    """Render the MarketData as a markdown table for the 'Numbers This Week' section."""
+    lines = ["| Metric | Current | Note |", "|---|---|---|"]
+
+    def row(metric: str, value: float | None, fmt: str, note: str = "") -> None:
+        if value is None:
+            lines.append(f"| {metric} | n/a | {note} |")
+        else:
+            lines.append(f"| {metric} | {fmt.format(value)} | {note} |")
+
+    # Treasury yields
+    change = market.treasury_10y_change
+    change_str = f"{change:+.2f} WoW" if change is not None else ""
+    row("10-year Treasury yield", market.treasury_10y, "{:.2f}%", change_str)
+    row("2-year Treasury yield", market.treasury_2y, "{:.2f}%")
+    row("3-month Treasury yield", market.treasury_3mo, "{:.2f}%")
+    # Macro
+    row("Federal Funds Rate", market.fed_funds, "{:.2f}%")
+    row("Core CPI (year-over-year)", market.cpi_yoy, "{:.1f}%")
+    row("30-year mortgage average", market.mortgage_30y, "{:.2f}%")
+    # ETFs
+    for ticker, data in market.etfs.items():
+        price = data.get("price")
+        yld = data.get("yield_pct")
+        if price is not None:
+            yld_str = f"trailing yield {yld:.2f}%" if yld else ""
+            lines.append(f"| {ticker} ETF price | ${price:,.2f} | {yld_str} |")
+    if market.as_of:
+        lines.append("")
+        lines.append(f"*Data as of {market.as_of}. Sources: {'; '.join(market.sources)}.*")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -585,16 +786,38 @@ def run_seo(state: State) -> None:
     log.info("Generated %d SEO page(s).", n)
 
 
+def run_market_data() -> None:
+    """Standalone fetch + print of the week's market snapshot. Useful for verifying
+    data sources work before wiring them into the weekly briefing."""
+    log.info("Fetching market data...")
+    market = fetch_market_data()
+    md = format_market_data_md(market)
+    print("\n" + "=" * 60)
+    print("MARKET DATA SNAPSHOT")
+    print("=" * 60)
+    print(md)
+    print("=" * 60 + "\n")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["daily", "seo", "both"], default="daily")
+    parser.add_argument(
+        "--mode",
+        choices=["daily", "seo", "both", "market_data"],
+        default="daily",
+    )
     parser.add_argument("--auto-send", action="store_true",
                         help="Auto-send the newsletter instead of leaving it as a draft.")
     args = parser.parse_args()
+
+    # market_data mode doesn't need Anthropic
+    if args.mode == "market_data":
+        run_market_data()
+        return 0
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         log.error("ANTHROPIC_API_KEY not set.")
